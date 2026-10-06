@@ -26,7 +26,7 @@ function pickFrom(names) {
 function callGemini(key, model, parts, stream) {
   return fetch(API + "models/" + encodeURIComponent(model) + (stream ? ":streamGenerateContent?alt=sse" : ":generateContent"), {
     method: "POST",
-    signal: AbortSignal.timeout(35000),
+    signal: AbortSignal.timeout(170000),
     headers: { "x-goog-api-key": key, "content-type": "application/json" },
     body: JSON.stringify({
       contents: [{ role: "user", parts }],
@@ -103,39 +103,56 @@ export default async (request) => {
     { text: prompt + "\n\nYanıtın sadece JSON olsun. Başka metin yazma." },
   ];
 
-  let upstream;
-  try { ({ res: upstream } = await startGemini(key, parts, true)); }
-  catch (e) { return new Response("Gemini did not answer in time: " + String(e && e.message || e), { status: 504 }); }
-  if (!upstream.ok) {
-    const text = await upstream.text();
-    return new Response(text, { status: upstream.status === 429 ? 429 : 502 });
-  }
-
-  const enc = new TextEncoder(), dec = new TextDecoder();
-  let buf = "";
-  const send = (ctl, obj) => ctl.enqueue(enc.encode("data: " + JSON.stringify(obj) + "\n\n"));
-  const handle = (ctl, line) => {
-    line = line.trim();
-    if (!line.startsWith("data:")) return;
-    let ev; try { ev = JSON.parse(line.slice(5)); } catch { return; }
-    if (ev.error) { send(ctl, { type: "error", error: { type: ev.error.status === "RESOURCE_EXHAUSTED" ? "overloaded_error" : "api_error", message: ev.error.message } }); return; }
-    const c = ev.candidates && ev.candidates[0];
-    if (!c) { if (ev.promptFeedback && ev.promptFeedback.blockReason) send(ctl, { type: "message_delta", delta: { stop_reason: "refusal" } }); return; }
-    const text = ((c.content && c.content.parts) || []).filter(p => !p.thought).map(p => p.text || "").join("");
-    if (text) send(ctl, { type: "content_block_delta", delta: { type: "text_delta", text } });
-    if (c.finishReason) {
-      const r = c.finishReason === "MAX_TOKENS" ? "max_tokens" : /SAFETY|PROHIBITED|BLOCK/.test(c.finishReason) ? "refusal" : "end_turn";
-      send(ctl, { type: "message_delta", delta: { stop_reason: r } });
-    }
-  };
-  const stream = upstream.body.pipeThrough(new TransformStream({
-    transform(chunk, ctl) {
-      buf += dec.decode(chunk, { stream: true });
-      let i;
-      while ((i = buf.indexOf("\n")) >= 0) { handle(ctl, buf.slice(0, i)); buf = buf.slice(i + 1); }
+  // Answer right away and keep the connection alive while Gemini thinks,
+  // so Netlify's 40 second limit for the first response never hits.
+  const enc = new TextEncoder();
+  const stream = new ReadableStream({
+    async start(ctl) {
+      const send = (obj) => ctl.enqueue(enc.encode("data: " + JSON.stringify(obj) + "\n\n"));
+      const fail = (type, message) => { send({ type: "error", error: { type, message } }); ctl.close(); };
+      ctl.enqueue(enc.encode(": start\n\n"));
+      const ping = setInterval(() => { try { ctl.enqueue(enc.encode(": ping\n\n")); } catch {} }, 5000);
+      let upstream;
+      try { ({ res: upstream } = await startGemini(key, parts, true)); }
+      catch (e) { clearInterval(ping); return fail("api_error", "Gemini did not answer in time: " + String(e && e.message || e)); }
+      if (!upstream.ok) {
+        clearInterval(ping);
+        const text = (await upstream.text()).slice(0, 500);
+        return fail(upstream.status === 429 ? "overloaded_error" : "api_error", upstream.status + " " + text);
+      }
+      const dec = new TextDecoder();
+      let buf = "";
+      const handle = (line) => {
+        line = line.trim();
+        if (!line.startsWith("data:")) return;
+        let ev; try { ev = JSON.parse(line.slice(5)); } catch { return; }
+        if (ev.error) { send({ type: "error", error: { type: ev.error.status === "RESOURCE_EXHAUSTED" ? "overloaded_error" : "api_error", message: ev.error.message } }); return; }
+        const c = ev.candidates && ev.candidates[0];
+        if (!c) { if (ev.promptFeedback && ev.promptFeedback.blockReason) send({ type: "message_delta", delta: { stop_reason: "refusal" } }); return; }
+        const text = ((c.content && c.content.parts) || []).filter(p => !p.thought).map(p => p.text || "").join("");
+        if (text) send({ type: "content_block_delta", delta: { type: "text_delta", text } });
+        if (c.finishReason) {
+          const r = c.finishReason === "MAX_TOKENS" ? "max_tokens" : /SAFETY|PROHIBITED|BLOCK/.test(c.finishReason) ? "refusal" : "end_turn";
+          send({ type: "message_delta", delta: { stop_reason: r } });
+        }
+      };
+      try {
+        const reader = upstream.body.getReader();
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buf += dec.decode(value, { stream: true });
+          let i;
+          while ((i = buf.indexOf("\n")) >= 0) { handle(buf.slice(0, i)); buf = buf.slice(i + 1); }
+        }
+        if (buf) handle(buf);
+      } catch (e) {
+        send({ type: "error", error: { type: "api_error", message: String(e && e.message || e) } });
+      }
+      clearInterval(ping);
+      ctl.close();
     },
-    flush(ctl) { if (buf) handle(ctl, buf); },
-  }));
+  });
 
   return new Response(stream, { headers: { "content-type": "text/event-stream", "cache-control": "no-cache" } });
 };
