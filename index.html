@@ -361,7 +361,9 @@ async function readPdf(bytes){
       const lum = 0.299*img.data[i] + 0.587*img.data[i+1] + 0.114*img.data[i+2];
       dark[j] = lum < 170 ? 1 : 0;
     }
-    pages.push({w: vp.width, h: vp.height, lines, canvas: cv, dark, pw: cv.width, ph: cv.height});
+    const pgObj = {w: vp.width, h: vp.height, lines, canvas: cv, dark, pw: cv.width, ph: cv.height};
+    pgObj.boxes = detectBoxes(pgObj);
+    pages.push(pgObj);
     setPct(1 + 12*p/pdf.numPages);
     $("pdetail").textContent = "Sayfa " + p + " / " + pdf.numPages;
   }
@@ -482,6 +484,7 @@ function layout(font, pg, region, text){
 }
 
 async function writePdf(bytes, info, answers, mode){
+  answers = answers.slice();
   const {PDFDocument, rgb, degrees} = PDFLib;
   const doc = await PDFDocument.load(bytes, {ignoreEncryption:true});
   doc.registerFontkit(fontkit);
@@ -493,6 +496,30 @@ async function writePdf(bytes, info, answers, mode){
   const overflow = [];
   const taken = {}; // keeps two answers out of the same space
 
+  const allBoxes = {};
+  info.pages.forEach((p, i) => (p.boxes || []).forEach(b => { allBoxes[b.id] = {...b, pi: i}; }));
+  const usedBox = new Set();
+  answers = answers.filter((a, k) => {
+    const id = String(a.kutu || a.box || "").toUpperCase().replace(/\s/g, "");
+    const b = allBoxes[id];
+    if (!b || usedBox.has(id)) return true;
+    usedBox.add(id);
+    const pdfPage = pdfPages[b.pi], pg = info.pages[b.pi];
+    const {width: PW, height: PH} = pdfPage.getSize();
+    const box = pdfPage.getCropBox ? pdfPage.getCropBox() : {x:0,y:0};
+    const sx = PW / pg.w, sy = PH / pg.h;
+    const text = safeText(font, a.answer);
+    const innerW = b.x1 - b.x0 - 14, innerH = b.bottom - b.top - 4;
+    let size = Math.min(17, innerH*0.8), lines = wrap(font, text, size, innerW);
+    while (size > 7 && (lines.length*size*1.05 > innerH || lines.some(l => font.widthOfTextAtSize(l, size) > innerW))){ size -= 0.5; lines = wrap(font, text, size, innerW); }
+    const tilt = ((k*37)%7 - 3) * 0.25;
+    const startY = b.bottom - 6 - (lines.length-1)*size*1.05;
+    lines.forEach((ln, i) => {
+      pdfPage.drawText(ln, {x: box.x + (b.x0 + 8 + (k%3))*sx, y: box.y + PH - (startY + i*size*1.05)*sy, size: size*sx, font, color: ink, rotate: degrees(tilt)});
+    });
+    return false;
+  });
+
   answers.forEach((a, k) => {
     const pi = Math.min(Math.max((parseInt(a.s)||1)-1,0), pdfPages.length-1);
     const pdfPage = pdfPages[pi], pg = info.pages[pi];
@@ -502,7 +529,7 @@ async function writePdf(bytes, info, answers, mode){
     const body = safeText(font, a.answer);
     const label = a.no ? a.no + ". " : "";
     let region, anchor = null;
-    if (mode === "image"){
+    if (mode === "image" || (a.l == null && a.y != null)){
       const x = Math.min(Math.max(+a.x||0.08, 0.02), 0.9) * pg.w;
       const y = Math.min(Math.max(+a.y||0.1, 0.02), 0.97) * pg.h;
       let y2 = Math.min(Math.max(+a.y2||0, 0), 1) * pg.h;
@@ -597,10 +624,57 @@ async function writePdf(bytes, info, answers, mode){
   return await doc.save();
 }
 
+/* Find empty answer boxes: rectangles drawn with thin lines, empty inside. Each cell gets an id K1, K2... */
+function detectBoxes(pg){
+  const S = SCALE, W = pg.pw, Hh = pg.ph, D = pg.dark;
+  const runs = [];
+  for (let y = 0; y < Hh; y++){
+    let x = 0; const base = y*W;
+    while (x < W){
+      if (!D[base+x]){ x++; continue; }
+      let e = x; while (e < W && D[base+e]) e++;
+      if (e - x >= 70*S) runs.push({y, xs:x, xe:e-1});
+      x = e;
+    }
+  }
+  // merge runs of neighbouring rows into thin rules
+  const rules = [];
+  for (const r of runs){
+    const m = rules.find(u => r.y - u.y1 <= 1 && Math.abs(u.xs - r.xs) <= 3*S && Math.abs(u.xe - r.xe) <= 3*S);
+    if (m){ m.y1 = r.y; } else rules.push({y0:r.y, y1:r.y, xs:r.xs, xe:r.xe});
+  }
+  const thin = rules.filter(u => u.y1 - u.y0 <= 3*S);
+  const colDark = (x, a, b) => { let c = 0, n = 0; for (let y = a; y <= b; y++){ n++; let hit = 0; for (let dx = -2; dx <= 2; dx++){ const xx = x+dx; if (xx >= 0 && xx < W && D[y*W+xx]) hit = 1; } c += hit; } return n ? c/n : 0; };
+  const inkInside = (x0, x1, y0, y1) => { let c = 0, n = 0; for (let y = y0; y <= y1; y += 2) for (let x = x0; x <= x1; x += 2){ n++; c += D[y*W+x]; } return n ? c/n : 1; };
+  const cells = [];
+  thin.sort((a,b) => a.y0 - b.y0);
+  for (let i = 0; i < thin.length; i++){
+    const a = thin[i];
+    const b = thin.slice(i+1).find(u => Math.abs(u.xs - a.xs) <= 3*S && Math.abs(u.xe - a.xe) <= 3*S);
+    if (!b) continue;
+    const gap = b.y0 - a.y1;
+    if (gap < 12*S || gap > 60*S) continue;
+    if (colDark(a.xs, a.y1, b.y0) < 0.85 || colDark(a.xe, a.y1, b.y0) < 0.85) continue;
+    if (inkInside(a.xs + 4*S, a.xe - 4*S, a.y1 + 3*S, b.y0 - 3*S) > 0.01) continue;
+    cells.push({x0: a.xs/S, x1: a.xe/S, top: a.y1/S, bottom: b.y0/S});
+  }
+  return cells;
+}
+
+/* Page pictures for the AI, with red K labels on the answer boxes. */
 async function pageImages(info, max){
   const blobs = [];
   for (const pg of info.pages.slice(0, max)){
-    blobs.push(await new Promise(r=>pg.canvas.toBlob(r,"image/jpeg",0.85)));
+    const src = pg.canvas, scale = Math.min(1, 1100/src.width);
+    const cv = document.createElement("canvas"); cv.width = Math.round(src.width*scale); cv.height = Math.round(src.height*scale);
+    const cx = cv.getContext("2d"); cx.drawImage(src, 0, 0, cv.width, cv.height);
+    const k = scale*SCALE;
+    cx.font = "bold " + Math.round(13*k) + "px sans-serif"; cx.textBaseline = "middle";
+    for (const b of pg.boxes || []){
+      cx.strokeStyle = "#d00"; cx.lineWidth = 2; cx.strokeRect(b.x0*k, b.top*k, (b.x1-b.x0)*k, (b.bottom-b.top)*k);
+      cx.fillStyle = "#d00"; cx.fillText(b.id, b.x0*k + 4*k, (b.top+b.bottom)/2*k);
+    }
+    blobs.push(await new Promise(r=>cv.toBlob(r,"image/jpeg",0.75)));
   }
   return blobs;
 }
@@ -683,31 +757,25 @@ $("go").addEventListener("click", async () => {
     const hasText = allText.replace(/[\s\d\W]/g,"").length > 40;
     let prompt, mode, opts = {signal: ctl.signal, cache:false, modelTier: getVal("len")==="detayli" || getVal("len")==="cokuzun" ? "complex" : "default"};
 
-    if (hasText){
-      mode = "text";
-      const qs = allText.match(/(^|\s)\d{1,3}\s*[.)]\s+\S/g) || [];
-      P.expect = Math.max(1, Math.min(qs.length || 5, 120));
-      let doc = "";
-      info.pages.forEach((p,i)=>{ doc += "\n=== Sayfa " + (i+1) + " ===\n"; p.lines.forEach(l=>{ doc += "S"+(i+1)+" L"+l.id+" | "+l.text+"\n"; }); });
-      prompt = rules() +
-`\n\nBelgenin her satırı "S<sayfa> L<satır> | metin" biçiminde verildi.
-Her cevap için:
-- "l": sorunun SON satırı. Şıklar varsa son şıkkın satırı.
-- "n": aynı sayfada cevap alanından sonra gelen ilk metin satırı. Genelde bir sonraki sorunun ilk satırı. Yoksa 0.
-Cevap "l" ile "n" arasındaki boş alana yazılacak.
-Sadece JSON dizisi döndür. Örnek: [{"no":"1","s":1,"l":7,"n":12,"answer":"Bitkinin ışıkla besin üretmesidir."}]
-\nBELGE:${doc.slice(0, 200000)}`;
-    } else {
-      mode = "image";
-      opts.images = await pageImages(info, 6);
-      P.expect = 6 * opts.images.length;
-      prompt = rules() +
-`\n\nEkteki resimler PDF sayfalarıdır. Sırayla Sayfa 1 Sayfa 2 diye düşün.
-Her cevap için cevabın yazılacağı BOŞ cevap alanını ver. Cevap çizgileri varsa o çizgilerin bulunduğu alanı ver.
-"x" alanın sol kenarı. "y" alanın üstü. "y2" alanın altı. Hepsi sayfa genişliği ve yüksekliğine göre 0 ile 1 arası oran. y yukarıdan aşağı.
-Alan sorunun metnine ya da bir sonraki soruya taşmasın.
-Sadece JSON dizisi döndür. Örnek: [{"no":"1","s":1,"x":0.1,"y":0.31,"y2":0.4,"answer":"100 derece."}]`;
-    }
+    let kn = 0;
+    info.pages.forEach(p => p.boxes.forEach(bx => { bx.id = "K" + (++kn); }));
+    const boxList = info.pages.map((p,i) => p.boxes.map(bx => bx.id + " Sayfa " + (i+1)).join(". ")).filter(Boolean).join(". ");
+    opts.images = await pageImages(info, 10);
+    mode = hasText ? "text" : "image";
+    const qs = allText.match(/(^|\s)\d{1,3}\s*[.)]\s+\S/g) || [];
+    P.expect = Math.max(1, kn || Math.min(qs.length || 5, 120));
+    let doc = "";
+    info.pages.forEach((p,i)=>{ doc += "\n=== Sayfa " + (i+1) + " ===\n"; p.lines.forEach(l=>{ doc += "S"+(i+1)+" L"+l.id+" | "+l.text+"\n"; }); });
+    prompt = rules() + `\n\nEkte PDF sayfalarının resimleri var. Sırayla Sayfa 1 Sayfa 2. Soruları anlamak için resimlere de bak. Sorular fotoğraf ya da çizim olabilir.` +
+      (kn ? `\n\nResimlerde kırmızı çerçeveli ve K1 K2 gibi etiketli kutular boş cevap kutularıdır. Kutular: ${boxList}.
+Her kutuya ayrı bir cevap yaz. Aynı görselin yanında birden fazla kutu varsa her kutuya farklı bir cevap yaz. Bir kutuya tek kısa cevap sığar.
+Kutu cevabı biçimi: {"no":"1","kutu":"K1","answer":"Diplomatik."}` : "") +
+      (hasText ? `\n\nBelgenin yazıları "S<sayfa> L<satır> | metin" biçiminde verildi.
+Kutusu olmayan sorularda "s" sayfa, "l" sorunun SON satırı, "n" cevap alanından sonraki ilk metin satırı. Yoksa 0.
+Satır cevabı biçimi: {"no":"2","s":1,"l":7,"n":12,"answer":"Bitkinin ışıkla besin üretmesidir."}
+\nBELGE:${doc.slice(0, 150000)}` : `\n\nKutusu olmayan sorularda cevabın yazılacağı BOŞ alanı ver. "s" sayfa. "x" sol kenar. "y" üst. "y2" alt. Hepsi 0 ile 1 arası oran. y yukarıdan aşağı.
+Alan biçimi: {"no":"2","s":1,"x":0.1,"y":0.31,"y2":0.4,"answer":"100 derece."}`) +
+      `\nSadece JSON dizisi döndür.`;
 
     setStage("think"); P.thinkT0 = performance.now()/1000; setPct(14);
     let streaming = false;
@@ -721,7 +789,7 @@ Sadece JSON dizisi döndür. Örnek: [{"no":"1","s":1,"x":0.1,"y":0.31,"y2":0.4,
     const data = await askAI(prompt, {images: opts.images, signal: opts.signal, onText: opts.onText, tier: opts.modelTier});
     const list = (Array.isArray(data) ? data : (data && data.answers) || [])
       .filter(x => x && x.answer)
-      .map((x,i)=>({no: cleanLine(String(x.no ?? (i+1)), false).replace(/\.$/,""), s: x.s, l: x.l, n: x.n, x: x.x, y: x.y, y2: x.y2, answer: clean(x.answer)}))
+      .map((x,i)=>({no: cleanLine(String(x.no ?? (i+1)), false).replace(/\.$/,""), kutu: x.kutu || x.box, s: x.s, l: x.l, n: x.n, x: x.x, y: x.y, y2: x.y2, answer: clean(x.answer)}))
       .filter(x => x.answer);
     if (!list.length) throw {code:"empty"};
 
