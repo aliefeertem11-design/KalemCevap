@@ -35,16 +35,22 @@ function callGemini(key, model, parts, stream) {
   });
 }
 
+// Try models in order. If one is busy (503), over its free quota (429), missing (404)
+// or failing (500), move on to the next one.
+const FALLBACK = ["gemini-flash-latest", "gemini-3.5-flash", "gemini-2.5-flash", "gemini-3-flash-preview", "gemini-3.1-flash-lite", "gemini-flash-lite-latest", "gemini-2.5-flash-lite"];
 async function startGemini(key, parts, stream) {
   const envModel = Netlify.env.get("MODEL");
-  let model = envModel || chosen || PREFERRED[0];
-  let res = await callGemini(key, model, parts, stream);
-  if (res.status === 404 && !envModel) {
-    const { names } = await listModels(key);
-    const next = pickFrom(names);
-    if (next && next !== model) { model = next; res = await callGemini(key, model, parts, stream); }
+  const order = [...new Set([envModel, chosen, ...FALLBACK].filter(Boolean))];
+  let res = null, model = null, tries = 0;
+  for (const m of order) {
+    if (tries >= 5) break;
+    tries++;
+    model = m;
+    res = await callGemini(key, m, parts, stream);
+    if (res.ok) { chosen = m; return { res, model }; }
+    if (![404, 429, 500, 503].includes(res.status)) break;
+    if (res.status === 503 && m === chosen) chosen = null;
   }
-  if (res.ok) chosen = model;
   return { res, model };
 }
 
