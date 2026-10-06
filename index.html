@@ -202,7 +202,7 @@ async function askAI(prompt, {images, signal, onText, tier}){
     body: JSON.stringify({prompt, images: imgs, tier})
   }).catch(e => { throw {code: e && e.name === "AbortError" ? "cancelled" : "network"}; });
   if (res.status === 401) throw {code:"need_code"};
-  if (!res.ok){ let t = ""; try { t = await res.text(); } catch {} throw {code: res.status === 429 ? "rate_limited" : "upstream_error", message: t}; }
+  if (!res.ok){ let t = ""; try { t = await res.text(); } catch {} throw {code: res.status === 429 ? "rate_limited" : "upstream_error", message: "HTTP " + res.status + " " + t}; }
   const reader = res.body.getReader(), dec = new TextDecoder();
   let buf = "", text = "", stop = "";
   try {
@@ -699,7 +699,7 @@ Sadece JSON dizisi döndür. Örnek: [{"no":"1","s":1,"l":7,"n":12,"answer":"Bit
 \nBELGE:${doc.slice(0, 200000)}`;
     } else {
       mode = "image";
-      opts.images = await pageImages(info, 8);
+      opts.images = await pageImages(info, 6);
       P.expect = 6 * opts.images.length;
       prompt = rules() +
 `\n\nEkteki resimler PDF sayfalarıdır. Sırayla Sayfa 1 Sayfa 2 diye düşün.
@@ -743,8 +743,8 @@ Sadece JSON dizisi döndür. Örnek: [{"no":"1","s":1,"x":0.1,"y":0.31,"y2":0.4,
     if (e && e.code === "cancelled") msg("Durduruldu.");
     else if (e && e.code === "need_code") { $("codeBox").hidden = false; $("code").focus(); msg("Erişim kodu gerekiyor ya da kod yanlış. Kodu yazıp tekrar dene.", true); }
     else if (e && e.code === "empty") msg("Belgede soru bulunamadı.", true);
-    else if (e && e.code) msg(errText(e.code), true);
-    else { console.error(e); msg("PDF işlenemedi. Dosya bozuk ya da şifreli olabilir.", true); }
+    else if (e && e.code) msg(errText(e.code) + (e.message ? " Ayrıntı: " + String(e.message).replace(/\s+/g, " ").slice(0, 300) : ""), true);
+    else { console.error(e); msg("PDF işlenemedi. Ayrıntı: " + String(e && (e.message || e)).slice(0, 300), true); }
   } finally {
     $("go").disabled = !file; $("stop").hidden = true;
   }
