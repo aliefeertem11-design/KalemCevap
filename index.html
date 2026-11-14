@@ -600,7 +600,7 @@ function figureLike(pg, z){
   return n >= 2;
 }
 function prepareBoxes(info){
-  info.pages.forEach(p => { p.boxes = p.boxes.filter(z => !personalNear(p, z) && !figureLike(p, z)); });
+  info.pages.forEach(p => { p.boxes = p.boxes.filter(z => !personalNear(p, z) && (z.fig || !figureLike(p, z))); });
   let kn = 0;
   info.pages.forEach(p => p.boxes.forEach(bx => { bx.id = "K" + (++kn); }));
   return kn;
@@ -609,7 +609,7 @@ function boxPart(info, idx){
   idx = idx || info.pages.map((_, i) => i);
   const kn = idx.reduce((n, i) => n + info.pages[i].boxes.length, 0);
   const cap = bx => { const h = bx.bottom - bx.top, rows = h <= 42 ? Math.max(1, Math.floor(h/12)) : Math.floor((h-4)/14); return Math.max(8, Math.floor((bx.x1 - bx.x0 - 14)/5.2)) * Math.max(1, rows); };
-  const list = idx.map(i => info.pages[i].boxes.map(bx => bx.id + " Sayfa " + (i+1) + " en fazla " + cap(bx) + " harf").join(". ")).filter(Boolean).join(". ");
+  const list = idx.map(i => info.pages[i].boxes.map(bx => bx.id + " Sayfa " + (i+1) + " en fazla " + (bx.fig ? Math.max(cap(bx), 20) : cap(bx)) + " harf").join(". ")).filter(Boolean).join(". ");
   return {kn, list};
 }
 function docText(info, idx){
@@ -618,6 +618,11 @@ function docText(info, idx){
   return doc;
 }
 const refNote = r => r ? `\nSon ${r} resim kitaptan kaynak sayfalardır. Ödev sayfası değildir. Cevapları bu kaynak sayfalardaki bilgilere dayandır.` : "";
+function figNote(info, idx){
+  const ids = idx.flatMap(i => (info.pages[i].boxes || []).filter(b => b.fig).map(b => b.id));
+  if (!ids.length) return "";
+  return `\nŞu K alanları bir haritanın ya da resmin ÜZERİNDEKİ boş kutulardır: ${ids.join(" ")}. Her birine, kutunun haritada ya da resimde gösterdiği yerin ya da parçanın adını yaz (kıta, okyanus, ülke, şehir, organ, parça adı gibi). Kutunun yerini resimdeki kırmızı K etiketinden bul ve kutunun hemen çevresine, içinde ya da oku gösterdiği yere bak. Bu kutuların HEPSİNİ doldur. Kısa yaz: 1 ile 3 kelime. Aynı adı iki kutuya yazma, ancak bir okyanus haritanın iki yanında görünüyorsa iki kutuya da yazılabilir.`;
+}
 function answerPrompt(info, hasText, refs, explain, idx){
   idx = idx || info.pages.map((_, i) => i);
   const {kn, list} = boxPart(info, idx);
@@ -626,7 +631,7 @@ function answerPrompt(info, hasText, refs, explain, idx){
     (kn ? `\n\nResimlerde kırmızı çerçeveli ve K1 K2 gibi etiketli alanlar cevap yazılabilecek boş yerlerdir. Alanlar: ${list}.
 Her cevabı ait olduğu sorunun ya da kutunun İÇİNDEKİ doğru K alanına yaz. Tablolarda doğru satır ve sütundaki alanı seç. Talimat metinlerine ve örnek olarak doldurulmuş yerlere cevap yazma.
 Bir alana bir cevap. Cevap o alanın harf sınırını geçmesin. Belgede kelime sınırı varsa ona da uy. Aynı K'yi iki kez kullanma. Uzun bir cevap aynı kutudaki alt alta K alanlarına bölünebilir. Cevap gerektirmeyen K alanlarını boş bırak.
-Alan kullanan her cevapta "kutu" zorunlu ve değeri resimdeki etiketin aynısı olsun. Örnek: "K3". Her cevaba ayrıca "s" sayfa numarasını da yaz. Biçim: {"no":"1","kutu":"K1","answer":"Close friends who joke together."}` : "") +
+Alan kullanan her cevapta "kutu" zorunlu ve değeri resimdeki etiketin aynısı olsun. Örnek: "K3". Her cevaba ayrıca "s" sayfa numarasını da yaz. Biçim: {"no":"1","kutu":"K1","answer":"Close friends who joke together."}` + figNote(info, idx) : "") +
     (hasText ? `\n\nBelgenin yazıları "S<sayfa> L<satır> | metin" biçiminde verildi.
 Kutusu olmayan sorularda "s" sayfa, "l" sorunun SON satırı, "n" cevap alanından sonraki ilk metin satırı. Yoksa 0.
 Satır cevabı biçimi: {"no":"2","s":1,"l":7,"n":12,"answer":"Bitkinin ışıkla besin üretmesidir."}
@@ -702,7 +707,27 @@ function planAnswers(info, answers, mode, font, mult){
     return null;
   };
   const putInZone = (a, b, text, k) => {
-    const innerW = b.x1 - b.x0 - 14, zh = b.bottom - b.top;
+    const zh = b.bottom - b.top;
+    if (b.fig){
+      // a label on a map or picture: no full stop, small margins, centered in its box
+      text = text.replace(/\.$/, ""); a = {...a, answer: a.answer.replace(/\.$/, "")};
+      const iw = b.x1 - b.x0 - 4;
+      let size = Math.min(14*mult, zh*0.72), lines = wrap(font, text, size, iw), stack = false;
+      const fits = () => lines.length*size*1.05 <= zh - 1 && lines.every(l => font.widthOfTextAtSize(l, size) <= iw);
+      while (size > 5 && !fits()){ size -= 0.5; lines = wrap(font, text, size, iw); }
+      if (!fits()){
+        // a very narrow box: the letters one under the other
+        stack = true; lines = Array.from(text.replace(/\s+/g, ""));
+        size = Math.min(12*mult, (zh - 2)/(lines.length*1.05));
+        while (size > 4 && lines.some(l => font.widthOfTextAtSize(l, size) > iw)) size -= 0.5;
+      }
+      const w = Math.max(...lines.map(l => font.widthOfTextAtSize(l, size)));
+      const x = b.x0 + Math.max(1, (b.x1 - b.x0 - w)/2);
+      const y = b.top + Math.max(0, (zh - lines.length*size*1.05)/2) + size*0.85;
+      items.push(makeItem(a, b.pi, x, y, size, size*1.05, iw, lines, k, {tilt: 0, stack}));
+      return;
+    }
+    const innerW = b.x1 - b.x0 - 14;
     if (zh <= 42){
       let size = Math.min(16*mult, zh*0.72), lines = wrap(font, text, size, innerW);
       const fits = () => lines.length*size*1.05 <= zh - 1 && lines.every(l => font.widthOfTextAtSize(l, size) <= innerW);
@@ -872,7 +897,7 @@ function planChecks(info, list, font){
 function rewrap(it, doc){
   const font = measurer(doc.font);
   if (it.page < 0){ it.lines = null; return; }
-  it.lines = wrap(font, safeText(font, it.text), it.size, it.maxW);
+  it.lines = it.stack ? Array.from(safeText(font, it.text).replace(/\s+/g, "")) : wrap(font, safeText(font, it.text), it.size, it.maxW);
 }
 
 /* ---------- drawing on the PDF ---------- */
@@ -1403,6 +1428,7 @@ function clean(s){
 }
 
 const SCALE = 2;
+const FIG_WORDS = /(kutucu|kutula|kutuya|kutuy|harita|boxes|label the|map)/i;
 async function readPdf(bytes, onPage){
   const pdf = await pdfjsLib.getDocument({data: bytes.slice()}).promise;
   const pages = [];
@@ -1440,6 +1466,15 @@ async function readPdf(bytes, onPage){
     }
     const pgObj = {w: vp.width, h: vp.height, lines, canvas: cv, dark, lite, pw: cv.width, ph: cv.height};
     pgObj.boxes = detectBoxes(pgObj);
+    // map / picture worksheets ("haritadaki kutucuklara yazınız"): also find the empty boxes drawn on the picture
+    if (FIG_WORDS.test(lines.map(l => l.text).join(" "))){
+      const figs = detectFigureBoxes(pgObj);
+      if (figs.length){
+        // a map box replaces any line-based box that sits on it
+        const hit = (o, z) => { const ow = Math.min(o.x1,z.x1)-Math.max(o.x0,z.x0), oh = Math.min(o.bottom,z.bottom)-Math.max(o.top,z.top); return ow > 0 && oh > -4; };
+        pgObj.boxes = pgObj.boxes.filter(o => !figs.some(z => hit(o, z))).concat(figs).sort((p, q) => (p.top - q.top) || (p.x0 - q.x0));
+      }
+    }
     pages.push(pgObj);
     onPage && onPage(p, pdf.numPages);
   }
@@ -1670,6 +1705,75 @@ function detectBoxes(pg){
   return zones;
 }
 
+/* Empty answer boxes drawn ON a map or picture (e.g. "write the continent names in the boxes").
+   detectBoxes() needs a clean white background around a box, so boxes on coloured map areas are missed.
+   Here: every closed, completely empty white rectangle with a dark frame on all four sides. */
+function detectFigureBoxes(pg){
+  // Empty answer boxes drawn on a map or picture. In the browser some of their sides can come out missing,
+  // so a box is found from one corner: a black or gray line across meeting one going down, with a white inside.
+  const S = SCALE, W = pg.pw, H = pg.ph, L = pg.lite;
+  // Box lines are black or gray. Colored land (red, orange, blue) can be just as dark, so color is left out here.
+  const px = pg.canvas.getContext("2d").getImageData(0, 0, W, H).data, D = new Uint8Array(W*H);
+  for (let j = 0, k = 0; j < W*H; j++, k += 4){
+    const r = px[k], g = px[k+1], b = px[k+2], lum = 0.299*r + 0.587*g + 0.114*b;
+    const chroma = Math.max(r, g, b) - Math.min(r, g, b);
+    D[j] = (lum < 110 && chroma < 70) || (lum < 175 && chroma < 35) ? 1 : 0;
+  }
+  const MIN = 8*S, MAXW = 320*S, MAXH = 90*S, GAP = 2, T = 6;
+  const hs = [], vbyx = Array.from({length: W}, () => []);
+  for (let y = 0; y < H; y++){
+    let s = -1, last = -100;
+    for (let x = 0; x <= W; x++){
+      if (x < W && D[y*W + x]){ if (s >= 0 && x - last > GAP + 1){ if (last - s + 1 >= MIN) hs.push({y, a: s, b: last}); s = x; } else if (s < 0) s = x; last = x; }
+    }
+    if (s >= 0 && last - s + 1 >= MIN) hs.push({y, a: s, b: last});
+  }
+  for (let x = 0; x < W; x++){
+    let s = -1, last = -100;
+    for (let y = 0; y <= H; y++){
+      if (y < H && D[y*W + x]){ if (s >= 0 && y - last > GAP + 1){ if (last - s + 1 >= MIN) vbyx[x].push({x, a: s, b: last}); s = y; } else if (s < 0) s = y; last = y; }
+    }
+    if (s >= 0 && last - s + 1 >= MIN) vbyx[x].push({x, a: s, b: last});
+  }
+  const near = (p, q) => Math.abs(p - q) <= T;
+  const ink = (x0, y0, x1, y1) => { let n = 0; for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) n += D[y*W + x]; return n; };
+  const seen = new Set(), out = [];
+  const tryBox = (x0, x1, y0, y1) => {
+    // a line that runs on past the box (into a frame or coast) is cut back
+    while (y1 - y0 > MIN && ink(x0, y1, x1, y1) > 0.5*(x1-x0+1)) y1--;
+    while (y1 - y0 > MIN && ink(x0, y0, x1, y0) > 0.5*(x1-x0+1)) y0++;
+    while (x1 - x0 > MIN && ink(x1, y0, x1, y1) > 0.5*(y1-y0+1)) x1--;
+    while (x1 - x0 > MIN && ink(x0, y0, x0, y1) > 0.5*(y1-y0+1)) x0++;
+    const w = x1 - x0 + 1, h = y1 - y0 + 1;
+    if (w < MIN || h < MIN || w > MAXW || h > MAXH || w*h < 150*S*S) return;
+    if (x0 < 4 || y0 < 4 || x1 > W-5 || y1 > H-5) return;
+    const key = (x0 >> 2) + "," + (y0 >> 2) + "," + (x1 >> 2) + "," + (y1 >> 2);
+    if (seen.has(key)) return; seen.add(key);
+    // white and empty inside: no printed text, no colored land
+    let white = 0, n = 0, dk = 0;
+    for (let y = y0 + 3; y <= y1 - 3; y++) for (let x = x0 + 3; x <= x1 - 3; x++){ n++; if (!L[y*W + x]) white++; dk += D[y*W + x]; }
+    if (n < 20 || white < 0.97 * n || dk > 0.002 * n) return;
+    // how many of the four sides have a line
+    const cover = (len, at) => { let k = 0; for (let i = 0; i < len; i++) if (at(i)) k++; return k / len; };
+    const lineAt = (x, y) => { for (let d = -3; d <= 3; d++){ if (D[(y+d)*W + x] || D[y*W + x + d]) return true; } return false; };
+    const sides = [cover(w, i => lineAt(x0+i, y0)), cover(w, i => lineAt(x0+i, y1)), cover(h, i => lineAt(x0, y0+i)), cover(h, i => lineAt(x1, y0+i))].filter(c => c >= 0.7).length;
+    if (sides < (w >= 24*S && h >= 10*S ? 2 : 3)) return;
+    const z = {x0: x0/S, x1: (x1+1)/S, top: y0/S, bottom: (y1+1)/S, onLine: false, fig: true};
+    const area = (z.x1-z.x0)*(z.bottom-z.top);
+    const i = out.findIndex(o => { const ow = Math.min(o.x1,z.x1)-Math.max(o.x0,z.x0), oh = Math.min(o.bottom,z.bottom)-Math.max(o.top,z.top); return ow > 0 && oh > 0 && ow*oh > 0.4*Math.min(area, (o.x1-o.x0)*(o.bottom-o.top)); });
+    if (i < 0) out.push(z);
+    else if (area > (out[i].x1-out[i].x0)*(out[i].bottom-out[i].top)) out[i] = z; // keep the whole box, not a part of it
+  };
+  if (hs.length > 60000) return [];
+  for (const h of hs) for (const ex of [h.a, h.b]){
+    for (let x = Math.max(0, ex - T); x <= Math.min(W - 1, ex + T); x++) for (const v of vbyx[x]){
+      if (!(near(h.y, v.a) || near(h.y, v.b))) continue;
+      tryBox(Math.min(h.a, v.x), Math.max(h.b, v.x), Math.min(v.a, h.y), Math.max(v.b, h.y));
+    }
+  }
+  return out;
+}
+
 /* Page pictures for the AI, with red K labels on the answer boxes. */
 async function pageImages(info, max){
   const blobs = [];
@@ -1739,4 +1843,5 @@ function errText(code){
 }
 
 </script>
+
 </html>
